@@ -25,6 +25,8 @@ from .models import (
     Production,
     ProductionInput,
     ProductionInputLocation,
+    Stocktake,
+    StocktakeItem,
     StockTransfer,
 )
 from .schemas import (
@@ -33,6 +35,7 @@ from .schemas import (
     RawBatchIn,
     ReviewIn,
     SplitIn,
+    StocktakeIn,
     SuspectIn,
     TransferIn,
 )
@@ -679,12 +682,206 @@ def transfer_stock(session: Session, data: TransferIn) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------- 库位盘点
+
+
+def _stocktake_out(session: Session, stocktake: Stocktake) -> dict[str, Any]:
+    """组装盘点单查询/提交响应：状态 + 逐行原值（按提交顺序 line_no）。"""
+    items = sorted(stocktake.items, key=lambda x: x.line_no)
+    created_at = stocktake.created_at
+    if created_at.tzinfo is None:
+        # SQLite 取回 naive datetime，统一为带时区的 ISO 8601 字符串
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return {
+        "stocktake_no": stocktake.stocktake_no,
+        "status": stocktake.status,
+        "note": stocktake.note,
+        "created_at": created_at.isoformat(),
+        "items": [
+            {
+                "line_no": item.line_no,
+                "batch_no": item.batch_no,
+                "location_code": item.location_code,
+                "unit": item.unit,
+                "book_qty": float(item.book_qty),
+                "actual_qty": float(item.actual_qty),
+                "diff_qty": float(item.diff_qty),
+            }
+            for item in items
+        ],
+    }
+
+
+def submit_stocktake(session: Session, data: StocktakeIn) -> dict[str, Any]:
+    """提交一张批次库位盘点单：逐行核对账面、按盘亏差额核销两层库存。
+
+    一张盘点单含多条互异的（批次, 库位）行，每行给出“所填账面量”与实点量
+    （二者均非负，实点量不得高于账面量），且整单至少一条盘亏（差额 > 0）。
+
+    任一不符**整单拒绝、不留任何盘点记录、不扣任何余量**：
+    1. 行内（批次, 库位）互异（DUPLICATE_STOCKTAKE_LINE 422）；
+    2. 逐行实点量 <= 账面量（STOCKTAKE_ACTUAL_EXCEEDS_BOOK 422）；
+    3. 整单至少一条差额为正（STOCKTAKE_NO_LOSS 422）；
+    4. 盘点单号未被占用（STOCKTAKE_NO_REUSED 409，单号不得复用）；
+    5. 批次存在（SOURCE_NOT_FOUND 404）；
+    6. 逐行核对**当前库位实存恰等于所填账面量**：库位不存在
+       （LOCATION_NOT_FOUND 404）或账面已变动（STOCKTAKE_BOOK_MISMATCH 409）。
+
+    全部通过后在**同一事务内**按各行差额（账面 - 实点）扣减对应库位余额与
+    批次全局余量，并固化不可修改的原账面量、实点量、差额、单位与时间。
+    隔离批次（含疑似）与已撤销产出批次**仍可核销**（盘点不是投料/分装，
+    也不移动库位）。既有 ``remaining_qty`` 仍表示实存，各库位之和仍等于
+    全局余量。
+
+    并发：盘点与生产撤销同属低频维护事务，事务一开始先取 QC 串行化锁
+    （PostgreSQL 为 ``LOCK TABLE batches IN SHARE ROW EXCLUSIVE``，与投料/
+    分装/撤销互斥、与并发盘点互斥；SQLite 由 ``BEGIN IMMEDIATE`` 全库
+    串行），再按批次编号升序锁批次行、按（批次, 库位编号）锁库位行。
+    “核对当前实存 == 账面”与“按差额扣减”在同一事务同一把行锁内完成，
+    故与投料、分装、调拨、生产撤销及并发盘点交错时不会超扣，也不会覆盖
+    并发事务写入的新余额；两个相同单号并发时唯一约束兜底，恰好一笔成功。
+    调拨只写库位表、不写批次表（仅 ROW SHARE），与盘点不发生表锁等待，
+    仅按统一加锁顺序在批次/库位行上串行。
+    """
+    # —— 纯输入校验（无需持锁）：行互异、实点 <= 账面、整单至少一条盘亏 ——
+    seen: set[tuple[str, str]] = set()
+    any_loss = False
+    for item in data.items:
+        key = (item.batch_no, item.location_code)
+        if key in seen:
+            raise errors.duplicate_stocktake_line(item.batch_no, item.location_code)
+        seen.add(key)
+        if item.actual_qty > item.book_qty:
+            raise errors.stocktake_actual_exceeds_book(item.batch_no, item.location_code)
+        if item.actual_qty < item.book_qty:
+            any_loss = True
+    if not any_loss:
+        raise errors.stocktake_no_loss()
+
+    _acquire_qc_lock(session)
+
+    # 单号不得复用（唯一约束兜底并发抢号）
+    existing_no = session.execute(
+        select(Stocktake.id).where(Stocktake.stocktake_no == data.stocktake_no)
+    ).scalar_one_or_none()
+    if existing_no is not None:
+        raise errors.stocktake_no_exists(data.stocktake_no)
+
+    # —— 统一加锁：先批次（编号升序），再各批次内的库位行（编号升序）——
+    batch_nos = sorted({item.batch_no for item in data.items})
+    locked_batches = _lock_batches_in_order(session, batch_nos)
+    locked_locations: dict[tuple[str, str], BatchLocation] = {}
+    for batch_no in batch_nos:
+        codes = sorted(
+            {item.location_code for item in data.items if item.batch_no == batch_no}
+        )
+        rows = _lock_locations(session, batch_no, codes)
+        for code, row in rows.items():
+            locked_locations[(batch_no, code)] = row
+
+    # —— 持锁逐行核对：批次存在、库位存在、当前库位实存恰等于所填账面量 ——
+    for item in data.items:
+        batch = locked_batches.get(item.batch_no)
+        if batch is None:
+            raise errors.batch_not_found(item.batch_no)
+        loc_row = locked_locations.get((item.batch_no, item.location_code))
+        if loc_row is None:
+            raise errors.location_not_found(item.batch_no, item.location_code)
+        if loc_row.qty != item.book_qty:
+            raise errors.stocktake_book_mismatch(
+                item.batch_no, item.location_code, item.book_qty, loc_row.qty
+            )
+
+    # —— 全部通过：写盘点单（单号唯一兜底）——
+    stocktake = Stocktake(
+        stocktake_no=data.stocktake_no,
+        status="ADJUSTED",
+        note=data.note,
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(stocktake)
+    try:
+        session.flush()
+    except IntegrityError:
+        raise errors.stocktake_no_exists(data.stocktake_no) from None
+
+    # —— 同事务按差额扣减库位层与全局层（核对用的是同一把锁内读到的值）——
+    per_batch_loss: dict[str, Decimal] = {}
+    for line_no, item in enumerate(data.items, start=1):
+        batch = locked_batches[item.batch_no]
+        loc_row = locked_locations[(item.batch_no, item.location_code)]
+        diff = item.book_qty - item.actual_qty
+        loc_row.qty -= diff
+        per_batch_loss[item.batch_no] = (
+            per_batch_loss.get(item.batch_no, Decimal("0")) + diff
+        )
+        session.add(
+            StocktakeItem(
+                stocktake_id=stocktake.id,
+                line_no=line_no,
+                batch_no=item.batch_no,
+                location_code=item.location_code,
+                unit=batch.unit,
+                book_qty=item.book_qty,
+                actual_qty=item.actual_qty,
+                diff_qty=diff,
+            )
+        )
+
+    for batch_no, loss in per_batch_loss.items():
+        if loss:
+            locked_batches[batch_no].remaining_qty -= loss
+
+    session.flush()
+    # 重新加载聚合（items 关系），统一走响应组装
+    saved = session.execute(
+        select(Stocktake)
+        .options(selectinload(Stocktake.items))
+        .where(Stocktake.id == stocktake.id)
+    ).scalar_one()
+    return _stocktake_out(session, saved)
+
+
+def get_stocktake(session: Session, stocktake_no: str) -> dict[str, Any]:
+    """查询盘点单：返回状态与逐行原账面量、实点量、差额和单位。
+
+    单号不存在 -> STOCKTAKE_NOT_FOUND(404)。盘点单不可修改，返回值即提交
+    瞬间固化的原值。
+    """
+    stocktake = session.execute(
+        select(Stocktake)
+        .options(selectinload(Stocktake.items))
+        .where(Stocktake.stocktake_no == stocktake_no)
+    ).scalar_one_or_none()
+    if stocktake is None:
+        raise errors.stocktake_not_found(stocktake_no)
+    return _stocktake_out(session, stocktake)
+
+
 # ---------------------------------------------------------------- 生产单撤销
 
 
 def _is_cancelled_output(session: Session, batch_no: str) -> bool:
     """该批次是否为一张已撤销生产单的产出（原料批次恒为 False）。"""
     return batch_no in _cancelled_output_nos(session, [batch_no])
+
+
+def _stocktake_loss_nos(session: Session, batch_no: str) -> list[str]:
+    """返回该批次曾发生盘亏（差额为正）的盘点单号（升序、去重）。
+
+    发生盘亏的生产产出不得撤销原生产单：盘点核销改的是实存，撤销会按原
+    投料量返还并把历史投料/谱系当作从未发生，二者并存会令库存与谱系自相
+    矛盾。盘点行不可修改，故只要存在盘亏行即永久阻止撤销。
+    """
+    rows = session.execute(
+        select(Stocktake.stocktake_no)
+        .join(StocktakeItem, StocktakeItem.stocktake_id == Stocktake.id)
+        .where(
+            StocktakeItem.batch_no == batch_no,
+            StocktakeItem.diff_qty > 0,
+        )
+    ).all()
+    return sorted({r[0] for r in rows})
 
 
 def _load_production_for_output(
@@ -781,6 +978,13 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     ).scalar_one_or_none()
     if review is not None:
         raise errors.production_has_review(output_no)
+
+    # 产出曾在盘点中发生盘亏则不得撤销：盘点核销改实存，撤销返还原投料并
+    # 作废历史投料/谱系，二者并存会使库存与谱系失配（盘点单不可修改）。
+    # 此处尚未锁来源批次，故只读盘点表，与盘点事务不发生行锁环。
+    loss_nos = _stocktake_loss_nos(session, output_no)
+    if loss_nos:
+        raise errors.output_has_stocktake_loss(output_no, loss_nos)
 
     # 统一按编号升序锁定来源批次（产出已锁），与并发投料/撤销保持一致加锁顺序
     source_nos = sorted({pi.source_no for pi in production.inputs})

@@ -256,6 +256,74 @@ class BatchReview(Base):
     batch: Mapped[Batch] = relationship(foreign_keys=[batch_no])
 
 
+class Stocktake(Base):
+    """批次库位盘点单：一次盘点提交多行（批次, 库位）账实核销。
+
+    盘点单凭唯一单号提交，成功后整单不可修改、单号不得复用；逐行保留原账面量、
+    实点量与盘亏差额及单位、时间。仅成功单据落库（校验失败整单回滚，不留记录）。
+    隔离批次与已撤销产出批次仍可被盘点核销。当前仅有一种终态 ADJUSTED（已核销）。
+    """
+
+    __tablename__ = "stocktakes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stocktake_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="ADJUSTED")
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    items: Mapped[list["StocktakeItem"]] = relationship(
+        back_populates="stocktake", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint("status = 'ADJUSTED'", name="ck_stocktake_status"),
+    )
+
+
+class StocktakeItem(Base):
+    """盘点单行：某个批次在某个库位上的原账面量、实点量与盘亏差额。
+
+    实点量不得高于账面量（差额 = 账面 - 实点 >= 0），整单至少一行差额为正。
+    账面/实点/差额均为提交瞬间固化的不可变原值（后续库存流动不改写本行）；
+    unit 随批次单位冗余存档，供逐行原值查询。同一盘点单内 (批次, 库位) 互异。
+    """
+
+    __tablename__ = "stocktake_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stocktake_id: Mapped[int] = mapped_column(
+        ForeignKey("stocktakes.id", ondelete="CASCADE"), nullable=False
+    )
+    # 提交顺序（1 起），查询按此顺序逐行返回
+    line_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    location_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+    book_qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    actual_qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    diff_qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+
+    stocktake: Mapped[Stocktake] = relationship(back_populates="items")
+    batch: Mapped[Batch] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "stocktake_id", "batch_no", "location_code", name="uq_stocktake_item_line"
+        ),
+        CheckConstraint("book_qty >= 0", name="ck_stocktake_book_non_negative"),
+        CheckConstraint("actual_qty >= 0", name="ck_stocktake_actual_non_negative"),
+        CheckConstraint("actual_qty <= book_qty", name="ck_stocktake_actual_within_book"),
+        CheckConstraint("diff_qty >= 0", name="ck_stocktake_diff_non_negative"),
+        CheckConstraint("diff_qty = book_qty - actual_qty", name="ck_stocktake_diff_formula"),
+        Index("ix_stocktake_item_batch", "batch_no"),
+    )
+
+
 class IdempotencyKey(Base):
     """请求幂等记录。
 

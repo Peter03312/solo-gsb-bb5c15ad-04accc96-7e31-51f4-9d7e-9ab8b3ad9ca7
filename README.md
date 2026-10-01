@@ -83,6 +83,8 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 | POST | `/batches/{batch_no}/splits` | 批次分装：一个父批次 → 多个可独立投料的子批次（可指定出库库位） |
 | POST | `/transfers` | 库位调拨：同一批次在两个不同库位间移动正数数量 |
 | GET | `/batches/{batch_no}/locations` | 查询批次逐库位余额（各库位之和等于全局余量） |
+| POST | `/stocktakes` | 库位盘点：凭唯一盘点单号提交多行（批次,库位,账面量,实点量）核销盘亏 |
+| GET | `/stocktakes/{stocktake_no}` | 查询盘点单：状态与逐行原账面量、实点量、差额和单位 |
 | POST | `/productions/{output_no}/cancellation` | 撤销录入错误的生产单：按原消耗库位返还、作废产出与投料边 |
 | GET | `/productions/{output_no}` | 按产出编号查询生产原单据（含撤销状态/原因） |
 | GET | `/batches/{batch_no}` | 查询批次余量与状态（`remaining_qty` 为全局余量，含义不变） |
@@ -118,7 +120,9 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
      后来也被撤销，本产出仍视为“曾被投料”而不可撤销）；
    - 产出**当前非疑似**（仅因疑似祖先被连带隔离不阻止撤销）；
    - 产出**无质检复核记录**；
-   - 该生产单**尚未撤销**（重复撤销明确拒绝）。
+   - 该生产单**尚未撤销**（重复撤销明确拒绝）；
+   - 产出**从未在盘点中发生盘亏**（盘点核销改实存，与撤销返还/作废谱系
+     不能并存；`OUTPUT_HAS_STOCKTAKE_LOSS` 409）。
 
    撤销在**同一事务内**：按各来源的**原投料量**返还余量（即使来源批次已隔离
    也照常返还；返还不会超过其历史消耗，余量恒不超过初始量）；生产单标记为
@@ -202,6 +206,51 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
     - 幂等沿用既有写操作的 `Idempotency-Key` 重放与冲突语义：同键同体重放
       返回首次结果、库存只移动一次，同键异体 `409 IDEMPOTENCY_CONFLICT`，
       失败不固化可重试。
+13. **库位盘点（stocktake）**：仓库盘点发现批次库位账实不符时，凭**唯一
+    盘点单号** `POST /stocktakes` 一次提交**多条互异**的行，每行含
+    批次、库位、**账面量（book_qty）**与**实点量（actual_qty）**。
+    - **数量语义**：账面量与实点量均**非负**（允许 0，整库位清零合法）；
+      实点量**不得高于**账面量（盘点只核销盘亏，不登记盘盈），差额
+      `diff_qty = 账面量 - 实点量`；整单**至少一条盘亏**（某行差额 > 0）。
+      同一单内（批次, 库位）组合必须**互异**，各行单位随各自批次存档
+      （不要求跨行单位一致）。
+    - **提交即核对**：服务在单事务加行锁后**逐行核对当前库位实存恰等于
+      所填账面量**。批次不存在 `404 SOURCE_NOT_FOUND`、库位不存在
+      `404 LOCATION_NOT_FOUND`（该批次在此库位无余额行）、账面已变动
+      （实存 ≠ 申报账面）`409 STOCKTAKE_BOOK_MISMATCH`（details 带
+      `submitted_book_qty` 与 `current_qty`）；行重复
+      `422 DUPLICATE_STOCKTAKE_LINE`、实点高于账面
+      `422 STOCKTAKE_ACTUAL_EXCEEDS_BOOK`、整单无盘亏
+      `422 STOCKTAKE_NO_LOSS`、数量为负或非法 `422 VALIDATION_ERROR`、
+      单号重复 `409 STOCKTAKE_NO_REUSED`。任一不符**整单拒绝、不写任何
+      盘点记录、不扣任何余量**（失败事务整体回滚，不留半行）。
+    - **核销**：全部核对通过后在**同一事务**内按各行差额扣减对应
+      **库位余额**与批次**全局余量**（差额为 0 的行不动）。既有
+      `remaining_qty` 字段仍表示**实存**，各库位之和仍恒等于全局余量。
+    - **不可修改 / 单号不得复用**：成功单据整单保留，逐行固化**原账面量、
+      实点量、差额、单位**及盘点时间，此后任何库存流动（调拨/投料/撤销/
+      再次盘点）都**不改写**这些原值；盘点单号全局唯一、不得复用。
+      `GET /stocktakes/{单号}` 返回状态（`ADJUSTED`）与按提交顺序排列的
+      逐行原值、差额和单位；单号不存在 `404 STOCKTAKE_NOT_FOUND`。
+    - **隔离批次与已撤销产出仍可核销**：盘点不是投料/分装，也不移动库位，
+      故隔离批次（含疑似）与已撤销生产单的产出批次都可以被盘点扣减。
+    - **盘亏产出不得撤销**：某生产产出**曾在盘点中发生盘亏**后，撤销入口
+      以 `OUTPUT_HAS_STOCKTAKE_LOSS`(409) 拒绝（details 的 `stocktake_nos`
+      列出涉及的盘点单号）——盘点核销改的是实存，撤销会按原投料量返还并
+      令历史投料/谱系作废，二者不能并存；**历史投料与谱系不因盘点改变**。
+      仅盘亏到来源批次、或产出自身盘点差额为 0 不阻止撤销；撤销返还的是
+      原投料量，已核销的盘亏不随撤销回滚。
+    - **并发**：盘点与生产撤销同属低频维护事务，事务一开始先取 QC 串行化
+      锁（PostgreSQL `LOCK TABLE batches IN SHARE ROW EXCLUSIVE`；SQLite
+      由 `BEGIN IMMEDIATE` 全库串行），随后遵循统一两级加锁顺序——先按
+      批次编号升序锁批次行，再按（批次, 库位编号）锁库位行。因此盘点与
+      **投料、分装、调拨、生产撤销及并发盘点**交错时，“核对账面”与“按
+      差额扣减”原子完成，**绝不超扣、绝不覆盖并发写入的新余额**；账面在
+      拿锁后被他事务改变时，本行以 `STOCKTAKE_BOOK_MISMATCH` 整单拒绝。
+      两个相同盘点单号并发时唯一约束兜底，恰好一笔成功。
+    - 幂等沿用既有 `Idempotency-Key` 重放与冲突语义：同键同体重放返回首次
+      状态码/响应、只核销一次；同键异体 `409 IDEMPOTENCY_CONFLICT`；失败
+      请求不固化，可凭同键修正后重试。
 
 ### 错误响应格式
 
@@ -216,7 +265,11 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 `OUTPUT_ALREADY_CONSUMED`(409)、`OUTPUT_ALREADY_SPLIT`(409)、`OUTPUT_IS_SUSPECT`(409)、
 `PRODUCTION_HAS_REVIEW`(409)、`PRODUCTION_ALREADY_CANCELLED`(409)、`BATCH_CANCELLED`(409)、
 `IDEMPOTENCY_CONFLICT`(409)、`LOCATION_NOT_FOUND`(404)、
-`TRANSFER_SAME_LOCATION`(422)、`TRANSFER_NO_REUSED`(409)。
+`TRANSFER_SAME_LOCATION`(422)、`TRANSFER_NO_REUSED`(409)、
+`DUPLICATE_STOCKTAKE_LINE`(422)、`STOCKTAKE_ACTUAL_EXCEEDS_BOOK`(422)、
+`STOCKTAKE_NO_LOSS`(422)、`STOCKTAKE_BOOK_MISMATCH`(409)、
+`STOCKTAKE_NO_REUSED`(409)、`STOCKTAKE_NOT_FOUND`(404)、
+`OUTPUT_HAS_STOCKTAKE_LOSS`(409)。
 
 ---
 
@@ -691,6 +744,95 @@ curl -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/transfers \
 # 投料 / 分装：仍 409 BATCH_QUARANTINED
 ```
 
+### 12. 库位盘点：凭盘点单号核销多行盘亏
+
+月末盘点发现 `RM-1` 在 `DEFAULT` 库位账实不符（账面 70、实点 65），同单还核对
+另一库位（A 库位账实相符、差额 0）。凭唯一盘点单号一次提交多行：
+
+```bash
+curl -X POST http://localhost:8080/stocktakes \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: stocktake-20261001-01' \
+  -d '{
+        "stocktake_no": "ST-20261001-01",
+        "note": "10 月月度盘点",
+        "items": [
+          {"batch_no": "RM-1", "location_code": "DEFAULT",
+           "book_qty": 70, "actual_qty": 65},
+          {"batch_no": "RM-1", "location_code": "A-01",
+           "book_qty": 30, "actual_qty": 30}
+        ]
+      }'
+```
+
+```json
+{
+  "stocktake_no": "ST-20261001-01",
+  "status": "ADJUSTED",
+  "note": "10 月月度盘点",
+  "created_at": "2026-10-01T08:32:39.496485+00:00",
+  "items": [
+    {"line_no": 1, "batch_no": "RM-1", "location_code": "DEFAULT",
+     "unit": "kg", "book_qty": 70.0, "actual_qty": 65.0, "diff_qty": 5.0},
+    {"line_no": 2, "batch_no": "RM-1", "location_code": "A-01",
+     "unit": "kg", "book_qty": 30.0, "actual_qty": 30.0, "diff_qty": 0.0}
+  ]
+}
+```
+
+核销后 `RM-1` 的 DEFAULT 库位与全局余量各扣 5（A-01 不动），两层仍恒等：
+
+```bash
+curl http://localhost:8080/batches/RM-1/locations
+# {"batch_no":"RM-1","unit":"kg","remaining_qty":95.0,
+#  "locations":[{"location_code":"A-01","quantity":30.0},
+#               {"location_code":"DEFAULT","quantity":65.0}]}
+```
+
+提交时服务逐行核对“**当前库位实存恰等于所填账面量**”。若盘点期间库存已被
+投料/调拨改动（账面已变动），或批次/库位不存在、实点高于账面、整单无盘亏，
+**整单拒绝、不留盘点记录**，可修正后以同一幂等键重试：
+
+```bash
+# 账面已被改动（申报 70，当前库位实存已为 60）
+# 409 {"error":{"code":"STOCKTAKE_BOOK_MISMATCH",
+#   "details":{"batch_no":"RM-1","location_code":"DEFAULT",
+#              "submitted_book_qty":"70","current_qty":"60.0000"}}}
+
+# 批次不存在：404 SOURCE_NOT_FOUND
+# 库位不存在：404 LOCATION_NOT_FOUND
+# 行内（批次, 库位）重复：422 DUPLICATE_STOCKTAKE_LINE
+# 实点量高于账面量：422 STOCKTAKE_ACTUAL_EXCEEDS_BOOK
+# 整单没有任何一行盘亏：422 STOCKTAKE_NO_LOSS
+# 账面量/实点量为负或非数字：422 VALIDATION_ERROR
+# 盘点单号已被占用：409 STOCKTAKE_NO_REUSED
+```
+
+查询盘点单返回状态与**逐行原值**（账面/实点/差额）和单位；这些值在提交后
+即固化，后续库存流动不改写：
+
+```bash
+curl http://localhost:8080/stocktakes/ST-20261001-01
+# 单号不存在 -> 404 STOCKTAKE_NOT_FOUND
+```
+
+盘点与撤销的联动：**隔离批次、已撤销产出批次仍可盘点核销**；但某生产产出
+一旦在盘点中发生过盘亏，其原生产单即不得撤销：
+
+```bash
+# MIX-1 曾被盘点核销（40 -> 35）
+curl -i -X POST http://localhost:8080/productions/MIX-1/cancellation \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cancel-mix1-01' \
+  -d '{"cancel_reason":"录入错误"}'
+# HTTP/1.1 409
+# {"error":{"code":"OUTPUT_HAS_STOCKTAKE_LOSS",
+#   "details":{"batch_no":"MIX-1","stocktake_nos":["ST-20261001-02"]}}}
+# 来源余量不返还、生产单不撤销；盘点不改动历史投料与谱系
+```
+
+盘点同样支持安全重试：同 `Idempotency-Key` + 同请求体重放返回首次响应且
+只核销一次；同键异体 `409 IDEMPOTENCY_CONFLICT`。
+
 ---
 
 ## 五、项目结构
@@ -703,16 +845,18 @@ app/
   models.py       # batches / batch_locations(库位余额) / productions(含撤销字段) /
                   # production_inputs(含申报库位) / production_input_locations
                   # (逐库位消耗明细) / stock_transfers(调拨单) / batch_splits /
-                  # batch_reviews / idempotency_keys
-  schemas.py      # Pydantic 请求响应模型（正数、定点数、库位编号、调拨、
-                  # 非空撤销原因、分装校验）
-  errors.py       # 业务错误码（含 LOCATION_NOT_FOUND / TRANSFER_*）
-  service.py      # 核心逻辑：登记、库位调拨、按库位投料/分装、生产事务、
-                  # 按原消耗库位撤销返还、幂等、递归谱系、污染传播、复核重算
-  routes.py       # HTTP 路由（含 /transfers 与 /batches/{no}/locations）
+                  # batch_reviews / stocktakes+stocktake_items(盘点单与逐行原值) /
+                  # idempotency_keys
+  schemas.py      # Pydantic 请求响应模型（正数/非负数量、定点数、库位编号、
+                  # 调拨、盘点、非空撤销原因、分装校验）
+  errors.py       # 业务错误码（含 LOCATION_NOT_FOUND / TRANSFER_* / STOCKTAKE_*）
+  service.py      # 核心逻辑：登记、库位调拨、库位盘点核销、按库位投料/分装、
+                  # 生产事务、按原消耗库位撤销返还（盘亏产出禁撤）、幂等、
+                  # 递归谱系、污染传播、复核重算
+  routes.py       # HTTP 路由（含 /transfers、/stocktakes 与 /batches/{no}/locations）
   main.py         # FastAPI 应用与异常处理
   entrypoint.py   # 容器入口：等待数据库 → 建表 → 启动
-tests/            # 端到端 + 并发测试（123 个用例，含库位功能与库位并发）
+tests/            # 端到端 + 并发测试（157 个用例，含库位/盘点功能与并发）
 Dockerfile
 docker-compose.yml
 ```
@@ -757,6 +901,18 @@ docker-compose.yml
   调拨并发等场景，结果都等价于某一串行顺序。隔离状态的判定只依赖批次行，
   与 QC 表锁/行锁的既有互斥关系不变，故隔离批次“可调拨、不可投料/分装”
   在任意并发结局下都成立。
+- **盘点并发**：盘点与生产撤销同属低频维护事务，事务一开始先取 QC 串行化
+  锁（PostgreSQL `LOCK TABLE batches IN SHARE ROW EXCLUSIVE`，与投料/分装/
+  撤销及并发盘点互斥；SQLite 由 `BEGIN IMMEDIATE` 全库串行），随后再按
+  统一两级顺序（批次编号升序 → 各批次内库位编号升序）加行锁。**“逐行核对
+  当前实存 == 所填账面量”与“按差额扣减两层余量”在同一事务同一把行锁内
+  完成**，故盘点与投料、分装、调拨、生产撤销及并发盘点交错时绝不超扣、
+  绝不覆盖并发事务写入的新余额；拿锁后账面若已被他事务改动，本行即以
+  `STOCKTAKE_BOOK_MISMATCH` 整单拒绝（不留单）。盘点写批次全局余量与库位
+  余额，调拨只写库位表（仅持 ROW SHARE，不与 QC 表锁冲突），二者只在
+  批次/库位行上按统一顺序串行。两个相同盘点单号并发由唯一约束兜底，恰好
+  一笔成功。盘点与撤销经 QC 锁互斥，因此“盘点盘亏产出”与“撤销该产出”
+  不会同时发生——任一并发结局下，发生过盘亏的产出都不会被撤销成功。
 
 > 注：新表 `batch_splits`、`batch_reviews` 与 `productions` 表的撤销字段
 > （`is_cancelled` / `cancel_reason` / `cancelled_at`）随启动/入口的
@@ -775,3 +931,13 @@ docker-compose.yml
 > 两层余额恒等，既有批次/生产/撤销接口的字段与行为不变，投料与分装仅
 > **新增可选**请求字段 `location_code`，批次查询的 `remaining_qty` 仍是
 > 全局余量。
+>
+> 盘点功能（本轮新增）同样自动升级：新表 `stocktakes`（盘点单：单号/状态/
+> 备注/时间）与 `stocktake_items`（逐行批次、库位、单位与不可修改的原账面
+> 量/实点量/差额）由启动 `CREATE TABLE IF NOT EXISTS` 创建，并带
+> “非负、实点 ≤ 账面、差额 = 账面 - 实点”的检查约束；既有数据无需回填、
+> 无需手工迁移。盘点是**纯新增**接口（`POST /stocktakes`、
+> `GET /stocktakes/{no}`），既有登记/生产/调拨/分装/污染/复核/撤销/查询
+> 接口的请求、响应字段与启动方式保持兼容；撤销接口仅**新增**一种拒绝情形
+> `OUTPUT_HAS_STOCKTAKE_LOSS`（产出曾发生盘亏），`remaining_qty` 仍表示
+> 实存，各库位之和仍等于全局余量。

@@ -24,8 +24,26 @@ def _to_decimal(value: object) -> Decimal:
     return dec
 
 
+def _to_non_negative_decimal(value: object) -> Decimal:
+    """盘点数量：允许为零，但不得为负；NaN/Inf 同样拒绝。"""
+    if isinstance(value, bool):
+        raise ValueError("数量不能为布尔值")
+    try:
+        dec = Decimal(str(value))
+    except Exception as exc:  # invalid literal
+        raise ValueError("数量必须是十进制数字") from exc
+    if not dec.is_finite():
+        raise ValueError("数量必须是有限数字")
+    if dec < 0:
+        raise ValueError("数量不得为负数")
+    return dec
+
+
 # 正数数量：入参即完成 > 0 校验
 PositiveQty = Annotated[Decimal, BeforeValidator(_to_decimal)]
+
+# 非负数量：盘点账面量/实点量允许为 0（整库位清零亦算合法核销）
+NonNegativeQty = Annotated[Decimal, BeforeValidator(_to_non_negative_decimal)]
 
 BatchNo = Annotated[str, Field(min_length=1, max_length=64, examples=["RM-20260930-01"])]
 Unit = Annotated[str, Field(min_length=1, max_length=16, examples=["kg"])]
@@ -107,6 +125,27 @@ class TransferIn(BaseModel):
         if source is not None and source == value:
             raise ValueError("来源库位与目标库位不得相同")
         return value
+
+
+class StocktakeLineIn(BaseModel):
+    """盘点单行：批次、库位、所填账面量与实点量（均非负）。
+
+    实点量不得高于账面量、整单至少一条盘亏等语义校验在服务层（持行锁后）
+    完成，以返回稳定的业务错误码并与账面变动核对保持同一原子时刻。
+    """
+
+    batch_no: BatchNo
+    location_code: LocationCode
+    book_qty: NonNegativeQty
+    actual_qty: NonNegativeQty
+
+
+class StocktakeIn(BaseModel):
+    """盘点单：凭唯一盘点单号提交多条互异的（批次, 库位）核销行。"""
+
+    stocktake_no: Annotated[str, Field(min_length=1, max_length=64, examples=["ST-20261001-01"])]
+    items: list[StocktakeLineIn] = Field(min_length=1)
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class ReviewIn(BaseModel):
@@ -285,3 +324,28 @@ class TransferOut(BaseModel):
     target_balance: float
     remaining_qty: float
     locations: list[LocationBalanceOut]
+
+
+class StocktakeLineOut(BaseModel):
+    """盘点单行查询：逐行原值（账面/实点/差额）与单位。
+
+    三项数量均为提交瞬间固化的不可变原值，后续库存流动不改写本行。
+    """
+
+    line_no: int
+    batch_no: str
+    location_code: str
+    unit: str
+    book_qty: float
+    actual_qty: float
+    diff_qty: float
+
+
+class StocktakeOut(BaseModel):
+    """盘点单：单号、状态、盘点时间与逐行原值（按提交顺序）。"""
+
+    stocktake_no: str
+    status: str
+    note: str | None = None
+    created_at: str
+    items: list[StocktakeLineOut]
