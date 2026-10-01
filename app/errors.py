@@ -167,6 +167,69 @@ def transfer_no_exists(transfer_no: str) -> AppError:
     )
 
 
+def duplicate_stock_check_line(batch_no: str, location_code: str) -> AppError:
+    return AppError(
+        "DUPLICATE_STOCK_CHECK_LINE",
+        f"同一盘点单中批次 {batch_no!r} 库位 {location_code!r} 重复出现，"
+        "各盘点行（批次 + 库位）必须互异",
+        422,
+        details={"batch_no": batch_no, "location_code": location_code},
+    )
+
+
+def stock_check_no_exists(stock_check_no: str) -> AppError:
+    return AppError(
+        "STOCK_CHECK_NO_REUSED",
+        f"盘点单号 {stock_check_no!r} 已存在，盘点单号不得复用",
+        409,
+        details={"stock_check_no": stock_check_no},
+    )
+
+
+def stock_check_no_loss() -> AppError:
+    return AppError(
+        "STOCK_CHECK_NO_LOSS",
+        "盘点单必须至少包含一条盘亏（实点量小于账面量）的行",
+        422,
+    )
+
+
+def stock_check_book_changed(
+    batch_no: str, location_code: str, book_qty: object, current_qty: object
+) -> AppError:
+    return AppError(
+        "STOCK_CHECK_BOOK_CHANGED",
+        f"批次 {batch_no!r} 库位 {location_code!r} 当前实存为 {current_qty}，"
+        f"与申报账面量 {book_qty} 不一致，账面已变动，整单拒绝",
+        409,
+        details={
+            "batch_no": batch_no,
+            "location_code": location_code,
+            "book_qty": str(book_qty),
+            "current_qty": str(current_qty),
+        },
+    )
+
+
+def stock_check_not_found(stock_check_no: str) -> AppError:
+    return AppError(
+        "STOCK_CHECK_NOT_FOUND",
+        f"盘点单 {stock_check_no!r} 不存在",
+        404,
+        details={"stock_check_no": stock_check_no},
+    )
+
+
+def output_has_stock_loss(batch_no: str, stock_check_nos: list[str]) -> AppError:
+    return AppError(
+        "OUTPUT_HAS_STOCK_LOSS",
+        f"产出批次 {batch_no!r} 已在盘点单（{', '.join(sorted(stock_check_nos))}）"
+        "中发生盘亏，发生盘亏的生产产出不得撤销原生产单",
+        409,
+        details={"batch_no": batch_no, "stock_check_nos": sorted(stock_check_nos)},
+    )
+
+
 def unit_mismatch(batch_no: str, expected: str, actual: str) -> AppError:
     return AppError(
         "UNIT_MISMATCH",

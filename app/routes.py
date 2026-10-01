@@ -25,6 +25,8 @@ from .schemas import (
     ReviewOut,
     SplitIn,
     SplitOut,
+    StockCheckIn,
+    StockCheckOut,
     SuspectIn,
     TransferIn,
     TransferOut,
@@ -252,6 +254,50 @@ def create_transfer(
 def get_batch_locations(batch_no: str, session: SessionDep) -> dict[str, Any]:
     """查询批次逐库位余额（按库位编号排序）；各库位之和等于全局余量。"""
     return service.get_batch_locations(session, batch_no)
+
+
+@router.post("/stock-checks", response_model=StockCheckOut, status_code=status.HTTP_201_CREATED)
+def create_stock_check(
+    body: StockCheckIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """仓库盘点：凭唯一盘点单号提交多条互异的（批次, 库位, 账面量, 实点量）。
+
+    两种数量非负、实点量不得高于账面量、整单至少一条盘亏；提交时逐行核对
+    当前库位实存恰等于账面量，任一不符整单拒绝、不留盘点记录。成功后同事务
+    按差额扣减库位与全局余量并固化不可修改的原值快照。必须携带幂等键。
+    """
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_201_CREATED, service.submit_stock_check(session, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
+@router.get("/stock-checks/{stock_check_no}", response_model=StockCheckOut)
+def get_stock_check(stock_check_no: str, session: SessionDep) -> dict[str, Any]:
+    """按单号查询盘点单：状态及逐行原值、差额与单位。"""
+    return service.get_stock_check(session, stock_check_no)
 
 
 @router.post("/contamination", response_model=DescendantsOut, status_code=status.HTTP_200_OK)

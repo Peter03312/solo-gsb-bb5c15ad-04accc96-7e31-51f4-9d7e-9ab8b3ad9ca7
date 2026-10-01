@@ -235,6 +235,73 @@ class StockTransfer(Base):
     )
 
 
+class StockCheck(Base):
+    """盘点单：一次仓库盘点凭唯一单号提交多条（批次, 库位）互异的行。
+
+    盘点允许盘亏（实点量 < 账面量），不允许盘盈（实点量不得高于账面量），
+    整单至少一条盘亏。成功后同事务按差额扣减对应库位行与批次全局余量；
+    盘点单与明细行只追加、不修改，原账面量/实点量/差额/单位永久保留。
+    单号全局唯一、不得复用。隔离批次与已撤销产出仍可核销盘亏。
+    """
+
+    __tablename__ = "stock_checks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_check_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # 盘点单状态：成功提交后即为 POSTED；提交失败整单回滚、不留任何记录
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="POSTED")
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    lines: Mapped[list["StockCheckLine"]] = relationship(
+        back_populates="stock_check", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_stock_checks_created", "created_at"),
+    )
+
+
+class StockCheckLine(Base):
+    """盘点单中的一行：某批次在某库位上的账面量、实点量与差额。
+
+    提交时逐行核对“当前库位实存恰等于账面量”，通过后按
+    book_qty - actual_qty 扣减库位行与批次全局余量。行内原值为
+    提交时刻的不可变快照，单位取批次单位一并固化（批次单位不会变更）。
+    盘亏行（loss_qty > 0）还用于撤销校验：发生过盘亏的生产产出不得
+    再撤销其原生产单。
+    """
+
+    __tablename__ = "stock_check_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_check_id: Mapped[int] = mapped_column(
+        ForeignKey("stock_checks.id", ondelete="CASCADE"), nullable=False
+    )
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    location_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    book_qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    actual_qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    loss_qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    stock_check: Mapped[StockCheck] = relationship(back_populates="lines")
+    batch: Mapped[Batch] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("book_qty >= 0", name="ck_stock_check_book_non_negative"),
+        CheckConstraint("actual_qty >= 0", name="ck_stock_check_actual_non_negative"),
+        CheckConstraint(
+            "actual_qty <= book_qty", name="ck_stock_check_actual_within_book"
+        ),
+        CheckConstraint("loss_qty = book_qty - actual_qty", name="ck_stock_check_loss"),
+        Index("ix_stock_check_line_batch_loc", "batch_no", "location_code"),
+    )
+
+
 class BatchReview(Base):
     """质检复核记录：确认某疑似批次为误报后撤销其疑似标记。
 
